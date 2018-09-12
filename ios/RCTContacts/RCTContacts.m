@@ -2,6 +2,13 @@
 #import <UIKit/UIKit.h>
 #import "RCTContacts.h"
 #import <AssetsLibrary/AssetsLibrary.h>
+#import "NBMetadataHelper.h"
+#import "NBPhoneMetaData.h"
+
+#import "NBNumberFormat.h"
+#import "NBPhoneNumber.h"
+#import "NBPhoneNumberDesc.h"
+#import "NBPhoneNumberUtil.h"
 
 @implementation RCTContacts {
     CNContactStore * contactStore;
@@ -85,10 +92,27 @@ RCT_EXPORT_METHOD(getContactsMatchingString:(NSString *)string callback:(RCTResp
     [self retrieveContactsFromAddressBook:contactStore withThumbnails:withThumbnails withCallback:callback];
 }
 
+-(void) getNormalizedContacts:(RCTResponseSenderBlock) callback
+               withThumbnails:(BOOL) withThumbnails withNationalDestinationCode: (NSString *)code
+{
+    CNContactStore* contactStore = [self contactsStore:callback];
+    if(!contactStore)
+        return;
+    [self retrieveNormalizedContactsFromAddressBook:contactStore withThumbnails:withThumbnails withNationalDestinationCode: code withCallback:callback];
+}
+
+
 RCT_EXPORT_METHOD(getAll:(RCTResponseSenderBlock) callback)
 {
     [self getAllContacts:callback withThumbnails:true];
 }
+
+
+RCT_EXPORT_METHOD(getNormalizedWithNationalDestinationCode:(NSString *)code callback:(RCTResponseSenderBlock) callback)
+{
+    [self getNormalizedContacts:callback withThumbnails:true withNationalDestinationCode: code];
+}
+
 
 RCT_EXPORT_METHOD(getAllWithoutPhotos:(RCTResponseSenderBlock) callback)
 {
@@ -125,10 +149,51 @@ RCT_EXPORT_METHOD(getAllWithoutPhotos:(RCTResponseSenderBlock) callback)
 
     CNContactFetchRequest * request = [[CNContactFetchRequest alloc]initWithKeysToFetch:keysToFetch];
     BOOL success = [contactStore enumerateContactsWithFetchRequest:request error:&contactError usingBlock:^(CNContact * __nonnull contact, BOOL * __nonnull stop){
+
         NSDictionary *contactDict = [self contactToDictionary: contact withThumbnails:withThumbnails];
         [contacts addObject:contactDict];
     }];
+    
+    callback(@[[NSNull null], contacts]);
+}
 
+-(void) retrieveNormalizedContactsFromAddressBook:(CNContactStore*)contactStore
+                         withThumbnails:(BOOL) withThumbnails
+                      withNationalDestinationCode: (NSString *) nationalDestinationCode
+                           withCallback:(RCTResponseSenderBlock) callback
+{
+    NSMutableArray *contacts = [[NSMutableArray alloc] init];
+    
+    NSError* contactError;
+    [contactStore containersMatchingPredicate:[CNContainer predicateForContainersWithIdentifiers: @[contactStore.defaultContainerIdentifier]] error:&contactError];
+    
+    
+    NSMutableArray *keysToFetch = [[NSMutableArray alloc]init];
+    [keysToFetch addObjectsFromArray:@[
+                                       CNContactEmailAddressesKey,
+                                       CNContactPhoneNumbersKey,
+                                       CNContactFamilyNameKey,
+                                       CNContactGivenNameKey,
+                                       CNContactMiddleNameKey,
+                                       CNContactPostalAddressesKey,
+                                       CNContactOrganizationNameKey,
+                                       CNContactJobTitleKey,
+                                       CNContactImageDataAvailableKey,
+                                       CNContactBirthdayKey
+                                       ]];
+    
+    if(withThumbnails) {
+        [keysToFetch addObject:CNContactThumbnailImageDataKey];
+    }
+    
+    CNContactFetchRequest * request = [[CNContactFetchRequest alloc]initWithKeysToFetch:keysToFetch];
+    BOOL success = [contactStore enumerateContactsWithFetchRequest:request error:&contactError usingBlock:^(CNContact * __nonnull contact, BOOL * __nonnull stop){
+        CNContact *normalizedContact = [self normalizeContact:contact withNationalDestinationCode:nationalDestinationCode];
+        
+        NSDictionary *contactDict = [self contactToDictionary: normalizedContact withThumbnails:withThumbnails];
+        [contacts addObject:contactDict];
+    }];
+    
     callback(@[[NSNull null], contacts]);
 }
 
@@ -647,4 +712,56 @@ RCT_EXPORT_METHOD(deleteContact:(NSDictionary *)contactData callback:(RCTRespons
     return YES;
 }
 
+-(CNContact *) normalizeContact: (CNContact *) contact withNationalDestinationCode: (NSString *) nationalDestinationCode {
+    
+    NBPhoneNumberUtil *phoneUtil = [[NBPhoneNumberUtil alloc] init];
+    NSError *anError = nil;
+    CNContact *normalizedContact = [[CNContact alloc] init];
+    NSMutableArray *newNumbers = [[NSMutableArray alloc] init];
+    
+    for (CNPhoneNumber *phoneNumber in contact.phoneNumbers) {
+        NSString *currentPhone = [[phoneNumber valueForKey:@"value"] stringValue];
+        NBPhoneNumber *parsedPhone = [phoneUtil parse:currentPhone defaultRegion:@"BR" error:&anError];
+        NSString *formattedPhone = [[NSString alloc] init];
+        
+        if (anError == nil) {
+            if (![phoneUtil isValidNumber:parsedPhone]) {
+                // Invalid numbers are discarded
+                return contact;
+            }
+//            NSLog(@"isValidPhoneNumber ? [%@]", [phoneUtil isValidNumber:parsedPhone] ? @"YES":@"NO");
+//            NSLog(@"E164: %@", [phoneUtil format:parsedPhone numberFormat:NBEPhoneNumberFormatE164 error:&anError]);
+            NSString *nationalSignificantNumber = [phoneUtil getNationalSignificantNumber:parsedPhone];
+            NSString *nationalDestinationCode = [[NSString alloc] init];
+             int nationalDestinationCodeLength = [phoneUtil getLengthOfNationalDestinationCode:parsedPhone error:nil];
+            
+            if (nationalDestinationCodeLength > 0) {
+                nationalDestinationCode = [nationalSignificantNumber substringWithRange:NSMakeRange(0, 2)];
+            } else {
+                nationalDestinationCode = @"";
+            }
+            
+            if ([nationalDestinationCode length] == 0) {
+                
+                // Appending National Destination Code to the current phone number
+                NSString *phoneNumberWithAreaCode = [NSString stringWithFormat:@"%@%@", nationalDestinationCode, [parsedPhone nationalNumber]];
+                NSNumberFormatter *f = [[NSNumberFormatter alloc] init];
+                f.numberStyle = NSNumberFormatterDecimalStyle;
+                NSNumber *newPhoneNumber = [f numberFromString:phoneNumberWithAreaCode];
+                [parsedPhone setNationalNumber:newPhoneNumber];
+            }
+            
+            
+            formattedPhone = [phoneUtil format:parsedPhone numberFormat:NBEPhoneNumberFormatE164 error:&anError];
+            CNPhoneNumber *normalizedNumber = [[CNPhoneNumber alloc] initWithStringValue:formattedPhone.description ];
+            [newNumbers addObject:normalizedNumber];
+            NSLog(@"Normalized number: %@", [normalizedNumber stringValue]);
+        } else {
+            NSLog(@"Error dealing with phone numbers from the agenda: %@", [anError localizedDescription]);
+        }
+    }
+    // Replacing phone numbers
+    [contact setValue:newNumbers forKey:@"phoneNumbers"];
+    return normalizedContact;
+}
 @end
